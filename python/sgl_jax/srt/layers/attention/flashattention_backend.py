@@ -87,6 +87,7 @@ class FlashAttention(AttentionBackend):
         self.page_size = page_size
         self.kv_partition_axis = kv_partition_axis
         self.forward_metadata = FlashAttentionMetadata()
+        # self.xai_temperature_len: float = 3.0
 
     def get_forward_metadata(self, batch: ModelWorkerBatch, mesh: Mesh):
         """Return the metadata for a forward pass."""
@@ -162,6 +163,7 @@ class FlashAttention(AttentionBackend):
             "vmem_limit_bytes": self.vmem_limit_bytes,
             "head_dim": self.head_dim,
             "page_size": self.page_size,
+            # "xai_temperature_len": self.xai_temperature_len,
         }
         return (children, aux_data)
 
@@ -173,6 +175,7 @@ class FlashAttention(AttentionBackend):
             aux_data["head_dim"],
             aux_data["vmem_limit_bytes"],
             aux_data["page_size"],
+            # aux_data["xai_temperature_len"],
         )
 
         obj.forward_metadata = children[0]
@@ -204,6 +207,8 @@ class FlashAttention(AttentionBackend):
             scale = 1.0 / jnp.sqrt(layer.head_dim)
         else:
             scale = layer.scaling
+        # xai_temperature_len = getattr(layer, "xai_temperature_len", -1.0)
+        xai_temperature_len = getattr(layer, "xai_temperature_len", 4.0)
 
         # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
         total_tokens = kv_cache_fused.shape[0]
@@ -224,6 +229,7 @@ class FlashAttention(AttentionBackend):
             P(),  # cu_q_lens
             P(),  # cu_kv_lens
             P(),  # distribution
+            # P(),  # xai_temperature_len
         )
         out_specs = (
             P(None, self.kv_partition_axis),  # attention output
@@ -246,6 +252,8 @@ class FlashAttention(AttentionBackend):
                 sm_scale=scale,
                 sliding_window=None,
                 soft_cap=None,
+                # xai_temperature_len=self.xai_temperature_len,
+                xai_temperature_len=xai_temperature_len,
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
@@ -270,6 +278,7 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
+            # self.forward_metadata.xai_temperature_len,
         )
 
         return (
