@@ -394,7 +394,7 @@ class TestAttention(CustomTestCase):
         jax.block_until_ready(jax_output)
 
         # q,k,v (1, 32, 128) (128, 8, 128) (128, 8, 128)
-        qkv_path = f'{mode}_{num_heads}_{head_dim}_{num_kv_heads}_{lens[0][0]}_{lens[0][1]}.npy'
+        qkv_path = f'{mode}_{num_heads}_{head_dim}_{num_kv_heads}_{lens[0][0]}_{lens[0][1]}_temp{mode_kwargs.get("xai_temperature_len", -1)}.npy'
         if qkv_path:
             # dump qkv to a numpy array
             q_fp32 = np.array(q.astype(jnp.float32))
@@ -405,6 +405,7 @@ class TestAttention(CustomTestCase):
 
             np.save(qkv_path, {'q': q_fp32, 'k': k_fp32, 'v': v_fp32, 'fa': fa_fp32, 'naive': naive_fp32})
             print(f"{qkv_path} saved!")
+            return
 
         print('q,k,v', q.shape, k.shape, v.shape)
 
