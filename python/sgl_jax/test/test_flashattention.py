@@ -166,7 +166,6 @@ def create_test_data(
     )
     # create q, k v
     q, k, v = create_qkv_cache(lens, num_heads, head_dim, num_kv_heads, page_size)
-
     # cache loc - match schedule_batch.py logic with align_to_size
     def align_to_size(l, size, value=0):
         align_len = (len(l) + size - 1) // size * size
@@ -291,6 +290,182 @@ class TestAttention(CustomTestCase):
         self.rng_key = jax.random.PRNGKey(42)
         np.random.seed(42)
 
+    def run_test_gpu(self, mode, lens, mode_args, qkv_path='', **mode_kwargs):
+        # Create mock forward_batch
+        num_heads, head_dim, num_kv_heads, page_size, dtype = mode_args
+
+        if dtype == jnp.bfloat16:
+            is_bf16 = True
+        else:
+            is_bf16 = False
+
+        forward_batch, q, k, v = create_test_data(
+            mode,
+            lens,
+            num_heads,
+            head_dim,
+            num_kv_heads,
+            page_size,
+            model_config={
+                "num_kv_heads": num_kv_heads,
+                "head_dim": head_dim,
+                "num_hidden_layers": 1,
+                "bf16": is_bf16,
+                "xai_temperature_len": mode_kwargs.get("xai_temperature_len", None),
+            },
+        )
+
+        # Debug cache mapping
+        print(f"=== Cache Mapping Debug ===")
+        print(f"lens: {lens}")
+        print(f"seq_lens: {forward_batch.seq_lens}")
+        print(f"cu_q_lens: {forward_batch.attn_backend.forward_metadata.cu_q_lens}")
+        print(f"cu_kv_lens: {forward_batch.attn_backend.forward_metadata.cu_kv_lens}")
+        print(f"cache_loc: {forward_batch.cache_loc[:100]}")
+        print(f"cache_loc[100:200]: {forward_batch.cache_loc[100:200]}")
+        print(f"out_cache_loc: {forward_batch.out_cache_loc[:100]}")
+
+        # Create test data
+        shading = jax.sharding.NamedSharding(mesh, P(None, "tensor"))
+        q_shard = jax.device_put(q.copy(), shading)
+        k_cache_shard = jax.device_put(k.copy(), shading)
+        v_cache_shard = jax.device_put(v.copy(), shading)
+
+        # write prefix tokens
+        extend_k, extend_v = write_prefix_tokens_for_kv(
+            forward_batch, lens, k_cache_shard, v_cache_shard
+        )
+
+        # JAX attention
+        attn = RadixAttention(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            scaling=head_dim**-0.5,
+            num_kv_heads=num_kv_heads,
+            layer_id=0,
+        )
+
+        padding_size = 4096
+        cache_loc_list = []
+
+        aligned_seq_lens = (
+            (forward_batch.seq_lens + page_size - 1) // page_size
+        ) * page_size
+        cache_start_loc = jnp.concatenate(
+            [jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(aligned_seq_lens)]
+        )
+        for i in range(forward_batch.batch_size):
+            start = cache_start_loc[i]
+            end = start + forward_batch.seq_lens[i]
+            cache_loc = forward_batch.cache_loc[start:end]
+            page_indices_for_seq = cache_loc // page_size
+            page_indices_unique = unique_in_original_order(page_indices_for_seq)
+            padded_page_indices = jnp.pad(
+                jnp.array(page_indices_unique, dtype=jnp.int32),
+                (0, padding_size - len(page_indices_unique)),
+                constant_values=0,
+            )
+            cache_loc_list.append(padded_page_indices)
+        page_table = jnp.stack(cache_loc_list)
+
+        expected = ref_ragged_paged_attention(
+            q.reshape(q.shape[0], num_heads, head_dim),
+            k.reshape(k.shape[0] // page_size, page_size, num_kv_heads, head_dim),
+            v.reshape(v.shape[0] // page_size, page_size, num_kv_heads, head_dim),
+            forward_batch.seq_lens,
+            page_table,
+            forward_batch.attn_backend.forward_metadata.cu_q_lens,
+            # forward_batch.attn_backend.forward_metadata.cu_kv_lens,
+            forward_batch.attn_backend.forward_metadata.num_seqs,
+            sm_scale=head_dim**-0.5,
+            **mode_kwargs,
+        )
+        jax.block_until_ready(expected)
+
+        @jax.jit
+        def jit_attn(q, k, v, forward_batch):
+            out = attn(q, k, v, forward_batch)
+            return out
+
+        attn.xai_temperature_len = mode_kwargs.get("xai_temperature_len", None)
+
+        # run
+        jax_output, _ = jit_attn(q_shard, extend_k, extend_v, forward_batch)
+        jax.block_until_ready(jax_output)
+
+        # q,k,v (1, 32, 128) (128, 8, 128) (128, 8, 128)
+        qkv_path = f'{mode}_{num_heads}_{head_dim}_{num_kv_heads}_{lens[0][0]}_{lens[0][1]}.npy'
+        if qkv_path:
+            # dump qkv to a numpy array
+            q_fp32 = np.array(q.astype(jnp.float32))
+            k_fp32 = np.array(k.astype(jnp.float32))
+            v_fp32 = np.array(v.astype(jnp.float32))
+            fa_fp32 = np.array(jax_output.astype(jnp.float32))
+            naive_fp32 = np.array(expected.astype(jnp.float32))
+
+            np.save(qkv_path, {'q': q_fp32, 'k': k_fp32, 'v': v_fp32, 'fa': fa_fp32, 'naive': naive_fp32})
+            print(f"{qkv_path} saved!")
+
+        print('q,k,v', q.shape, k.shape, v.shape)
+
+
+        rtol = 2e-2  # Relative tolerance
+        atol = 1e-2  # Absolute tolerance
+        jax_flat = np.asarray(jax_output)
+        expected_flat = np.asarray(expected.reshape(expected.shape[0], -1))
+        diff = np.abs(jax_flat - expected_flat)
+        max_diff = np.max(diff)
+
+        print(f"=== Detailed Analysis ===")
+        print(f"JAX output shape: {jax_flat.shape}")
+        print(f"Expected shape: {expected_flat.shape}")
+        print(f"Max difference: {max_diff}")
+
+        # Analyze by token dimension (rows) - show only first 5 tokens
+        print(f"\n=== Token-wise Analysis (first 20 tokens) ===")
+        num_tokens = jax_flat.shape[0]
+        for i in range(min(num_tokens, 20)):
+            jax_row = np.asarray(jax_flat[i])
+            expected_row = np.asarray(expected_flat[i])
+            row_diff = np.abs(jax_row - expected_row)
+            jax_mean = np.mean(jax_row)
+            expected_mean = np.mean(expected_row)
+            jax_std = np.std(jax_row)
+            expected_std = np.std(expected_row)
+
+            print(
+                f"Token {i}: max_diff={float(np.max(row_diff)):.6f}, jax_mean={float(jax_mean):.6f}, expected_mean={float(expected_mean):.6f}, jax_std={float(jax_std):.6f}, expected_std={float(expected_std):.6f}"
+            )
+            print()
+
+        # Overall statistics
+        print(f"=== Overall Statistics ===")
+        print(
+            f"JAX output:      mean={float(np.mean(jax_flat)):.6f}, std={float(np.std(jax_flat)):.6f}"
+        )
+        print(
+            f"Expected output: mean={float(np.mean(expected_flat)):.6f}, std={float(np.std(expected_flat)):.6f}"
+        )
+        print(
+            f"Absolute diff:   mean={float(np.mean(diff)):.6f}, std={float(np.std(diff)):.6f}, max={float(np.max(diff)):.6f}"
+        )
+
+        # Check how many tokens have large differences
+        large_diff_tokens = int(
+            np.sum(np.max(diff.reshape(num_tokens, -1), axis=1) > 0.1)
+        )
+        print(f"Tokens with max diff > 0.1: {large_diff_tokens}/{num_tokens}")
+
+        are_close = np.allclose(
+            jax_flat,
+            expected_flat,
+            rtol=rtol,
+            atol=atol,
+        )
+        self.assertTrue(
+            are_close,
+            f"JAX output and expected output are not close, max diff: {max_diff}",
+        )
     def run_test(self, mode, lens, mode_args, **mode_kwargs):
         # Create mock forward_batch
         num_heads, head_dim, num_kv_heads, page_size, dtype = mode_args
@@ -660,6 +835,109 @@ class TestAttention(CustomTestCase):
             (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16),
             xai_temperature_len=512,
         )
+
+    def test_gqa_prefill_accuracy_page_size_1_temperature_dump(self):
+        """Test JAX attention accuracy against PyTorch reference
+        Testcase (1024, 1024) fails on token 607, possible precision issue?
+        Token 607: max_diff=0.023438, jax_mean=-0.011597, expected_mean=-0.011597, jax_std=0.048096, expected_std=0.047607
+        """
+        # Parameters
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+        lens = [
+            (1, 128),
+            (3, 20),
+            (64, 64),
+            (20, 20),
+            (125, 125),
+            # (1024, 1024),
+            (123, 522),
+            (1, 511),
+        ]
+        for lens_i in lens:
+            self.run_test_gpu(
+                "prefill",
+                [lens_i],
+                (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+                xai_temperature_len=512,
+            )
+
+    def test_gqa_prefill_accuracy_page_size_1_temperature(self):
+        """Test JAX attention accuracy against PyTorch reference
+        Testcase (1024, 1024) fails on token 607, possible precision issue?
+        Token 607: max_diff=0.023438, jax_mean=-0.011597, expected_mean=-0.011597, jax_std=0.048096, expected_std=0.047607
+        """
+        # Parameters
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+        lens = [
+            (1, 128),
+            (3, 20),
+            (64, 64),
+            (20, 20),
+            (125, 125),
+            # (1024, 1024),
+            (123, 522),
+            (1, 511),
+        ]
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            xai_temperature_len=512,
+        )
+
+    def test_gqa_decode_accuracy_page_size_1_temperature(self):
+        """Test JAX attention accuracy against native fa"""
+        # Parameters
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+        lens = [
+            (1, 119),
+            (1, 127),
+            (1, 128),
+            (1, 129),
+            (1, 133),
+            (1, 1001),
+            (1, 1023),
+            (1, 1024),
+            (1, 1025),
+        ]
+
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            xai_temperature_len=512,
+        )
+
+    def test_gqa_decode_accuracy_page_size_1_temperature_dump(self):
+        """Test JAX attention accuracy against native fa"""
+        # Parameters
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+        lens = [
+            (1, 119),
+            (1, 127),
+            (1, 128),
+            (1, 129),
+            (1, 133),
+            (1, 1001),
+            (1, 1023),
+            (1, 1024),
+            (1, 1025),
+        ]
+        for lens_i in lens:
+            self.run_test_gpu(
+                "decode",
+                [lens_i],
+                (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+                xai_temperature_len=512,
+            )
 
 
 if __name__ == "__main__":
